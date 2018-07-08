@@ -1,0 +1,241 @@
+## INPUT ##
+
+# Define schema for human_genes
+#@source
+#human_genes(
+#	gene_name	text
+#).
+
+# Define schema for pubmed abstracts
+@source
+articles(
+	@key
+	@distributed_by
+	id	text,
+	@searchable
+	content	text
+).
+
+# NLP function
+#function nlp_markup over (
+#	 doc_id	    text,
+#	 content    text
+#	 ) returns rows like sentences
+#	 implementation"udf/nlp_markup.sh" handles tsv lines.
+
+#sentences += nlp_markup(doc_id, content) :-
+#	  pubmed_atherosclerosis(doc_id, content).
+
+
+
+# Define schema for sentences
+@source
+sentences(
+	@key
+	@distributed_by
+	doc_id		text,
+	@key
+	sentence_index	int,
+	@searchable
+	sentence_text	text,
+	tokens		text[],
+	lemmas		text[],
+	pos_tags	text[],
+	ner_tags	text[],
+	doc_offsets	int[],
+	dep_types	text[],
+	dep_tokens	int[]
+).
+
+## CANDIDATE MAPPING ##############
+
+# Map all human gene mentions in text
+@extraction
+gene_mention(
+	@key
+	mention_id	text,
+	@searchable
+	mention_text	text,
+	@distributed_by
+	@references(relation="sentences", column="doc_id", alias="appears_in")
+	doc_id		text,
+	@references(relation="sentences", column="doc_id", alias="appears_in")
+	sentence_index	int,
+	word_index	int   # Find where in sentence gene is mentioned
+).
+
+# MAP GENE MENTION function
+function map_gene_mention over(
+   doc_id		text,
+   sentence_index	int,
+   tokens		text[],
+   lemmas		text[]
+   ) returns rows like gene_mention
+   implementation "udf/map_gene_mention.py" handles tsv lines.
+
+# Apply MAP GENE function
+gene_mention += map_gene_mention(
+   doc_id, sentence_index, tokens, lemmas
+   ) :-
+   sentences(doc_id, sentence_index, _, tokens, lemmas, _, _, _, _, _).
+
+# Declare schema for gene pair table
+gene_pair(
+   g1_id   text,
+   g1_name text,
+   g2_id   text,
+   g2_name text
+).
+
+# Variable to count the number of gene mentions in a sentence
+num_genes(doc_id, sentence_index, COUNT(g)) :-
+   gene_mention(g, _, doc_id, sentence_index, _).
+
+gene_pair(g1, g1_name, g2, g2_name) :-
+   num_genes(same_doc, same_sentences, num_g),
+   gene_mention(g1, g1_name, same_doc, same_sentence, g1_index),
+   gene_mention(g2, g2_name, same_doc, same_sentence, g2_index),
+   num_g < 4,
+   g1 < g2, # Gene 1 appears before Gene 2
+   g1_name != g2_name, # Gene 1 name is different from that of Gene 2
+   g1_index != g2_index. # Genes 1 and 2
+
+## LINGUISTIC FEATURE EXTRACTION ##
+
+@extraction
+gene_pair_feature(
+   @key
+   @reference(relation="do_genes_interact", column="g1_id", alias="genes_interact")
+   g1_id   text,
+   @key
+   @reference(relation="do_genes_interact", column="g2_id", alias="genes_interact")
+   g2_id   text,
+   feature text
+).
+
+# Function to extract DDLIB features
+
+function extract_gene_pair_features over(
+   g1_id 	text,
+   g2_id	text,
+   g1_index	int,
+   g2_index	int,
+   doc_id	text,
+   sent_index	int,
+   tokens	text[],
+   lemmas	text[],
+   pos_tags	text[],
+   ner_tags	text[],
+   dep_types	text[],
+   dep_tokens	int[]
+   ) returns rows like spouse_feature
+   implementation "udf/extract_features.py" handles tsv lines.
+
+gene_pair_feature += extract_gene_pair_features(
+   g1_id, g2_id, g1_index, g2_index, doc_id, sent_index, tokens, lemmas,
+   pos_tags, ner_tags, dep_types, dep_tokens
+) :-
+   gene_mention(g1_id, _, doc_id, sent_index, g1_index),
+   gene_mention(g2_id, _, doc_id, sent_index, g2_index),
+   sentences(doc_id, sent_index, _, tokens, lemmas, pos_tags, ner_tags, _, dep_types, dep_tokens).
+
+## DISTANT SUPERVISION ##
+
+@source
+biogrid_gene_pairs(
+   g1_name	text,
+   g2_name	text
+).
+
+
+@extraction
+gene_pair_label(
+   @key
+   @reference(relation="do_genes_interact", column="g1_id", alias="genes_interact")
+   g1_id   text,
+   @key
+   @reference(relation="do_genes_interact", column="g2_id", alias="genes_interact")
+   g2_id   text,
+   label   int,
+   rule_id text
+).
+
+# Make all pairs unsupervised examples
+gene_pair_label(g1,g2, 0, NULL) :- gene_pair(g1, _, g2, _).
+
+# Mark as positive those genes that appear in biogrid dataset
+gene_pair_label(g1,g2, 5, "from_biogrid") :- gene_pair(g1, g1_name, g2, g2_name),
+biogrid_gene_pairs(BG1, BG2), [BG1 = g1_name, BG2 = g2_name ; BG2 = g1_name, BG1 = g2_name].
+
+# SUPERVISION FUNCTION TO PREDICT INTERACTION
+
+function supervise over(
+   g1_id text, g1_index int,
+   g2_id text, g2_index int,
+   doc_id      		text,
+   sentence_index	int,
+   sentence_text	text,
+   tokens		text[],
+   lemmas		text[],
+   pos_tags		text[],
+   ner_tags		text[],
+   dep_types		text[],
+   dep_tokens		int[]
+   ) returns (
+     g1_id text, g2_id text, label int, rule_id text
+   )
+   implementation "udf/supervise.py" handles tsv lines.
+
+gene_pair_label += supervise(
+   g1_id, g1_index,
+   g2_id, g2_index,
+   doc_id, sentence_index, sentence_text,
+   tokens, lemmas, pos_tags, ner_tags, dep_types, dep_token_indexes
+) :-
+  gene_pair(g1_id, _, g2_id, _),
+  gene_mention(g1_id, _, doc_id, sentence_index, g1_index),
+  gene_mention(g2_id, _,      _,              _, g2_index),
+  sentences(
+     doc_id, sentence_index, sentence_text,
+     tokens, lemmas, pos_tags, ner_tags, _, dep_types, dep_token_indexes
+  ).
+
+# Resolve multiple labels
+
+gene_pair_label_resolved(g1_id, g2_id, SUM(vote)) :- gene_pair_label(g1_id, g2_id, vote, rule_id).
+
+## OUTPUT ##
+
+# This application's goal is to predict whether a given pair of genes are indicating a gene-gene
+# interaction in Atherosclerosis
+
+do_genes_interact?(
+   @key
+   @reference(relation="gene_mention", column="mention_id", alias="g1")
+   g1_id   text,
+   g1_name text,
+   @key
+   @reference(relation="gene_mention", column="mention_id", alias="g2")
+   g2_id   text,
+   g2_name text
+).
+
+# Assign the resolved label for the gene pair
+do_genes_interact(g1_id, g1_name, g2_id, g2_name) =
+if l > 0 then TRUE
+else if l < 0 then FALSE
+else NULL end :-
+gene_pair_label_resolved(g1_id, g2_id, l),
+ gene_pair(g1_id, g1_name, g2_id, g2_name).
+## INFERENCE RULES ##
+
+# Features
+@weight(f)
+do_genes_interact(g1_id, g1_name, g2_id, g2_name) :-
+   gene_pair(g1_id, g1_name, g2_id, g2_name),
+   gene_pair_feature(g1_id, g2_id, f).
+
+# Inference rule: Symmetry (If Gene A interacts with Gene B, then Gene B interacts with Gene A)
+@weight(3.0)
+do_genes_interact(g1_id, g1_name, g2_id, g2_name) => do_genes_interact(g2_id, g2_name, g2_id, g2_name) :-
+   gene_pair(g1_id, g1_name, g2_id, g2_name).
